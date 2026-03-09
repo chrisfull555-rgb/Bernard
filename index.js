@@ -90,7 +90,7 @@ Only say this once you truly have all the details.`;
     const done = reply.toLowerCase().includes("have a great day") || reply.toLowerCase().includes("i will make sure");
     if (done) {
       session.done = true;
-      saveCallSummary(callSid, session).catch(console.error);
+      saveCallSummary(callSid, session, false).catch(console.error);
     }
 
     return { text: reply, done };
@@ -101,40 +101,71 @@ Only say this once you truly have all the details.`;
   }
 }
 
-// Push call summary to Firebase Realtime Database
-async function saveCallSummary(callSid, session) {
+// Push call summary to Firebase
+async function saveCallSummary(callSid, session, hungUp = false) {
   if (!OPENAI_API_KEY) return;
   try {
-    const transcript = session.history.map(m => `${m.role === 'user' ? 'Caller' : 'Bernard'}: ${m.content}`).join('\n');
     const { default: fetch } = await import('node-fetch');
+    const id = Date.now();
+    const time = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
 
-    // Generate summary with OpenAI
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'user', content: `Extract call info as JSON only, no markdown:\n{"name":"...","type":"business or client or personal","reason":"short phrase","detail":"1-2 sentences","tag":"urgent or normal"}\n\nTranscript:\n${transcript}` }],
-        max_tokens: 150,
-        temperature: 0.2
-      })
-    });
+    let summary;
 
-    const data = await res.json();
-    const raw = (data.choices?.[0]?.message?.content || '{}').replace(/```json|```/g, '').trim();
-    const summary = JSON.parse(raw);
+    // If caller hung up early with little or no conversation
+    if (hungUp && session.history.length <= 2) {
+      summary = {
+        id,
+        name: 'Unknown',
+        number: session.callerNumber || 'Unknown',
+        type: 'personal',
+        reason: 'Hung up',
+        detail: 'Caller hung up before leaving a message.',
+        tag: 'normal',
+        time,
+        reviewed: false,
+        done: false,
+        hungUp: true,
+        transcript: session.history.map(m => ({
+          speaker: m.role === 'user' ? 'Caller' : 'Bernard',
+          text: m.content
+        }))
+      };
+    } else {
+      // Generate AI summary from transcript
+      const transcript = session.history.map(m => `${m.role === 'user' ? 'Caller' : 'Bernard'}: ${m.content}`).join('\n');
 
-    summary.id = Date.now();
-    summary.number = session.callerNumber || 'Unknown';
-    summary.time = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-    summary.reviewed = false;
-    summary.done = false;
-    summary.transcript = session.history.map(m => ({
-      speaker: m.role === 'user' ? (summary.name || 'Caller') : 'Bernard',
-      text: m.content
-    }));
+      const extraInstruction = hungUp
+        ? 'Note: the caller hung up before the conversation was finished. Summarize what was captured so far.'
+        : '';
 
-    // Push to Firebase Realtime Database
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: `Extract call info as JSON only, no markdown:\n{"name":"...","type":"business or client or personal","reason":"short phrase","detail":"1-2 sentences","tag":"urgent or normal"}\n${extraInstruction}\n\nTranscript:\n${transcript}` }],
+          max_tokens: 150,
+          temperature: 0.2
+        })
+      });
+
+      const data = await res.json();
+      const raw = (data.choices?.[0]?.message?.content || '{}').replace(/```json|```/g, '').trim();
+      summary = JSON.parse(raw);
+      summary.id = id;
+      summary.number = session.callerNumber || 'Unknown';
+      summary.time = time;
+      summary.reviewed = false;
+      summary.done = false;
+      summary.hungUp = hungUp;
+      if (hungUp) summary.reason = summary.reason + ' (hung up early)';
+      summary.transcript = session.history.map(m => ({
+        speaker: m.role === 'user' ? (summary.name || 'Caller') : 'Bernard',
+        text: m.content
+      }));
+    }
+
+    // Push to Firebase
     const dbRes = await fetch(`${FIREBASE_DB_URL}/calls/${summary.id}.json`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -142,7 +173,7 @@ async function saveCallSummary(callSid, session) {
     });
 
     if (dbRes.ok) {
-      console.log(`Call saved to Firebase: ${summary.name} - ${summary.reason}`);
+      console.log(`Call saved to Firebase: ${summary.name} - ${summary.reason}${hungUp ? ' [HUNG UP]' : ''}`);
     } else {
       console.error('Firebase write failed:', await dbRes.text());
     }
@@ -189,6 +220,27 @@ app.post('/respond', async (req, res) => {
   const { text, done } = await bernardReply(callSid, speech);
   res.type('text/xml');
   res.send(twiml(text, done));
+});
+
+// ROUTE: Twilio calls this when a call ends for any reason
+app.post('/status', (req, res) => {
+  const callSid = req.body.CallSid;
+  const callStatus = req.body.CallStatus;
+  const session = sessions[callSid];
+
+  console.log(`Call ${callSid} ended with status: ${callStatus}`);
+
+  // If call ended but we never saved a summary, caller hung up early
+  if (session && !session.done) {
+    console.log(`Caller hung up early on ${callSid} — saving partial summary`);
+    saveCallSummary(callSid, session, true).catch(console.error);
+    session.done = true;
+  }
+
+  // Clean up session after a delay
+  setTimeout(() => { delete sessions[callSid]; }, 5000);
+
+  res.sendStatus(200);
 });
 
 // ROUTE: Health check
