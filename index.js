@@ -9,10 +9,9 @@ const OWNER_NAME = process.env.OWNER_NAME || 'Chris';
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "Chris's Painting Co.";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Store active call sessions in memory
 const sessions = {};
 
-// Helper: sanitize text for TwiML - removes all special XML chars
+// Strip special XML characters so TwiML never breaks
 function safe(text) {
   return (text || '')
     .replace(/&/g, 'and')
@@ -23,7 +22,7 @@ function safe(text) {
     .trim();
 }
 
-// Helper: build a TwiML response
+// Build TwiML response
 function twiml(sayText, hangup = false) {
   const cleaned = safe(sayText);
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -36,57 +35,62 @@ function twiml(sayText, hangup = false) {
 </Response>`;
 }
 
-// Helper: call OpenAI and get Bernard's reply
+// Get Bernard's reply from OpenAI
 async function bernardReply(callSid, userSaid) {
   const session = sessions[callSid];
-  if (!session) return { text: "I am sorry I lost track of our call. Please call back.", done: true };
+  if (!session) return { text: "Sorry I lost track of our call. Please call back.", done: true };
 
-  // Keep history from getting too long
   if (session.history.length > 12) session.history = session.history.slice(-12);
-
   session.history.push({ role: 'user', content: userSaid });
 
-  const system = `You are Bernard, ${OWNER_NAME}s AI receptionist for ${BUSINESS_NAME}.
-Answer calls on behalf of ${OWNER_NAME} who is unavailable.
+  const system = `You are Bernard, a professional phone assistant who handles calls for ${OWNER_NAME} at ${BUSINESS_NAME}.
+You answer the phone when ${OWNER_NAME} is unavailable. You sound calm, natural, and human.
 
-CRITICAL RULES:
-- Maximum 2 short sentences per response. You are voice only.
-- Never use apostrophes, ampersands, quotes, or special characters in replies.
-- Never say you are human if sincerely asked.
-- Always get the callers name first before anything else.
+RULES:
+- Keep every response to 1 sentence maximum. Short and natural.
+- Never mention you are an AI, a bot, or automated in any way.
+- If someone directly asks if you are a real person, say you are ${OWNER_NAME}s assistant and redirect the conversation.
+- Never use apostrophes, ampersands, quotes, or any special characters in your replies.
+- Sound warm and natural like a real receptionist, not robotic.
+- Always get the callers name first if you do not have it.
+- Do not repeat yourself or over-explain.
 
-HOW TO SCREEN CALLS:
-Business crew calling about:
-  - Materials needed: ask what materials and which job site
-  - Help on a job: ask which job site and what the problem is
-  - A question: let them ask it and confirm you will pass it to ${OWNER_NAME}
-Client calling for ${OWNER_NAME}: take a message and ask if there is anything specific to pass along
-Personal call: friendly and open, just ask why they are calling
-Urgent call (emergency, accident): say ${OWNER_NAME} will be notified immediately
+HOW TO HANDLE CALLS:
+Painting crew calling about materials: ask what they need and which job site.
+Painting crew needing help on a job: ask which site and what the issue is.
+Painting crew with a question: let them ask it and confirm you will pass it along.
+Client wanting to speak to ${OWNER_NAME}: take their message naturally, ask if anything specific to pass along.
+Personal call: friendly and casual, just ask what it is about.
+Urgent or emergency: tell them ${OWNER_NAME} will be reached right away.
 
-TO END THE CALL say these exact words when done collecting info:
-"Perfect I have got all of that noted. I will make sure ${OWNER_NAME} gets this message. Have a great day."`;
+TO WRAP UP THE CALL:
+When you have everything you need say exactly:
+"Perfect I will make sure ${OWNER_NAME} gets this. Have a great day."
+Only say this once you truly have all the details.`;
 
   try {
     const { default: fetch } = await import('node-fetch');
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`
+      },
       body: JSON.stringify({
         model: 'gpt-4o-mini',
         messages: [{ role: 'system', content: system }, ...session.history],
-        max_tokens: 100,
-        temperature: 0.5
+        max_tokens: 60,
+        temperature: 0.4
       })
     });
 
     if (!res.ok) {
       console.error('OpenAI error:', res.status, await res.text());
-      return { text: "I am having trouble right now. Could you say that again?", done: false };
+      return { text: "Sorry about that, could you say that one more time?", done: false };
     }
 
     const data = await res.json();
-    const reply = data.choices?.[0]?.message?.content?.trim() || "I am sorry could you repeat that?";
+    const reply = data.choices?.[0]?.message?.content?.trim() || "Sorry could you repeat that?";
     session.history.push({ role: 'assistant', content: reply });
 
     const done = reply.toLowerCase().includes("have a great day") || reply.toLowerCase().includes("i will make sure");
@@ -99,11 +103,11 @@ TO END THE CALL say these exact words when done collecting info:
 
   } catch (err) {
     console.error('Fetch error:', err.message);
-    return { text: "I am sorry I am having trouble. Please call back shortly.", done: false };
+    return { text: "Sorry I am having trouble. Please call back shortly.", done: false };
   }
 }
 
-// Helper: generate and log call summary
+// Generate and log call summary
 async function saveCallSummary(callSid, session) {
   if (!OPENAI_API_KEY) return;
   try {
@@ -127,15 +131,17 @@ async function saveCallSummary(callSid, session) {
     summary.time = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
     summary.reviewed = false;
     summary.done = false;
-    summary.transcript = session.history.map(m => ({ speaker: m.role === 'user' ? (summary.name || 'Caller') : 'Bernard', text: m.content }));
+    summary.transcript = session.history.map(m => ({
+      speaker: m.role === 'user' ? (summary.name || 'Caller') : 'Bernard',
+      text: m.content
+    }));
     console.log('CALL SUMMARY:', JSON.stringify(summary, null, 2));
-    // TODO: push to Firebase Realtime DB in Phase 2
   } catch (err) {
     console.error('Summary error:', err.message);
   }
 }
 
-// ROUTE: Incoming call from Twilio
+// ROUTE: Incoming call
 app.post('/incoming', (req, res) => {
   const callSid = req.body.CallSid;
   const callerNumber = req.body.From || 'Unknown';
@@ -143,14 +149,14 @@ app.post('/incoming', (req, res) => {
 
   sessions[callSid] = { history: [], callerNumber, done: false, silenceCount: 0 };
 
-  const greeting = `Hi, you have reached ${OWNER_NAME}s phone. My name is Bernard, I am ${OWNER_NAME}s AI assistant. Could I get your name and find out how I can help you today?`;
+  const greeting = `Hey there, you have reached ${OWNER_NAME}s phone, this is Bernard. Who am I speaking with today?`;
   sessions[callSid].history.push({ role: 'assistant', content: greeting });
 
   res.type('text/xml');
   res.send(twiml(greeting, false));
 });
 
-// ROUTE: Handle what the caller says
+// ROUTE: Handle caller speech
 app.post('/respond', async (req, res) => {
   const callSid = req.body.CallSid;
   const speech = (req.body.SpeechResult || '').trim();
@@ -158,13 +164,12 @@ app.post('/respond', async (req, res) => {
 
   console.log(`[${callSid}] Heard: "${speech}"`);
 
-  // Nothing heard
   if (!speech) {
     if (!session) { res.type('text/xml'); res.send(twiml("I could not hear you. Please call back. Goodbye!", true)); return; }
     session.silenceCount = (session.silenceCount || 0) + 1;
     if (session.silenceCount >= 2) { res.type('text/xml'); res.send(twiml("I am sorry I cannot hear you. Please try calling back. Goodbye!", true)); return; }
     res.type('text/xml');
-    res.send(twiml("I am sorry I did not catch that. Could you say that again?", false));
+    res.send(twiml("Sorry I did not catch that, could you say that again?", false));
     return;
   }
 
@@ -175,9 +180,13 @@ app.post('/respond', async (req, res) => {
   res.send(twiml(text, done));
 });
 
-// ROUTE: Health check - visit this URL to confirm Bernard is running
+// ROUTE: Health check
 app.get('/', (req, res) => {
-  res.send(`<h2>Bernard is running</h2><p>Owner: ${OWNER_NAME}</p><p>Business: ${BUSINESS_NAME}</p><p>OpenAI key: ${OPENAI_API_KEY ? 'Connected' : 'MISSING - add to Railway variables'}</p><p>Active sessions: ${Object.keys(sessions).length}</p>`);
+  res.send(`<h2>Bernard is running</h2>
+    <p>Owner: ${OWNER_NAME}</p>
+    <p>Business: ${BUSINESS_NAME}</p>
+    <p>OpenAI key: ${OPENAI_API_KEY ? 'Connected' : 'MISSING - add to Railway variables'}</p>
+    <p>Active sessions: ${Object.keys(sessions).length}</p>`);
 });
 
 const PORT = process.env.PORT || 3000;
