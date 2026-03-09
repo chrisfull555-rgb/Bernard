@@ -153,22 +153,60 @@ app.post('/respond', async (req, res) => {
 
   console.log(`📞 [${callSid}] Caller said: "${speechResult}"`);
 
-  const reply = await bernardReply(callSid, speechResult);
   const session = sessions[callSid];
+
+  // If nothing was heard, prompt once then hang up politely
+  if (!speechResult.trim()) {
+    if (!session) {
+      res.type('text/xml');
+      res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Matthew" language="en-US">I'm sorry, I couldn't hear you. Please call back and I'll be happy to help. Goodbye!</Say>
+  <Hangup/>
+</Response>`);
+      return;
+    }
+    session.silenceCount = (session.silenceCount || 0) + 1;
+    if (session.silenceCount >= 2) {
+      res.type('text/xml');
+      res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Matthew" language="en-US">I'm sorry I couldn't hear you. Please try calling back. Goodbye!</Say>
+  <Hangup/>
+</Response>`);
+      return;
+    }
+    res.type('text/xml');
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Matthew" language="en-US">I'm sorry, I didn't catch that. Could you say that again?</Say>
+  <Gather input="speech" action="/respond" method="POST" speechTimeout="3" timeout="8" language="en-US">
+  </Gather>
+</Response>`);
+    return;
+  }
+
+  // Reset silence count on successful speech
+  if (session) session.silenceCount = 0;
+
+  const reply = await bernardReply(callSid, speechResult);
   const isDone = session?.done;
+
+  // Escape any special XML characters in reply
+  const safeReply = reply.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
   res.type('text/xml');
   if (isDone) {
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Matthew" language="en-US">${reply}</Say>
+  <Say voice="Polly.Matthew" language="en-US">${safeReply}</Say>
   <Hangup/>
 </Response>`);
   } else {
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Matthew" language="en-US">${reply}</Say>
-  <Gather input="speech" action="/respond" method="POST" speechTimeout="auto" language="en-US">
+  <Say voice="Polly.Matthew" language="en-US">${safeReply}</Say>
+  <Gather input="speech" action="/respond" method="POST" speechTimeout="3" timeout="8" language="en-US">
   </Gather>
 </Response>`);
   }
